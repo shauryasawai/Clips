@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, text
 import time
 import logging
 from typing import List
@@ -35,18 +36,35 @@ app.add_middleware(
     max_age=600
 )
 
-# Database dependency with error handling
+# Improved database dependency with better error handling
 def get_db():
     db = None
     try:
         db = SessionLocal()
+        # Test the connection before yielding
+        db.execute(text("SELECT 1"))
         yield db
     except Exception as e:
-        logging.error(f"Database connection failed: {e}")
-        raise HTTPException(status_code=503, detail="Database connection failed")
+        logging.error(f"Database connection failed in get_db(): {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "error": "Database connection failed",
+                "message": str(e),
+                "troubleshooting": "Check /debug/database for more details"
+            }
+        )
     finally:
         if db:
-            db.close()
+            try:
+                db.close()
+            except:
+                pass
 
 # Simplified logging for serverless
 logging.basicConfig(
@@ -54,9 +72,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# Remove startup event that tries to connect to database
-# @app.on_event("startup") - NOT NEEDED FOR VERCEL
 
 # In-memory rate limiting for serverless
 request_counts = defaultdict(list)
@@ -136,6 +151,9 @@ async def root():
         "endpoints": {
             "documentation": "/docs",
             "health": "/health",
+            "debug_env": "/debug/env",
+            "debug_database": "/debug/database",
+            "debug_vercel": "/debug/vercel",
             "setup_database": "/admin/setup-db",
             "seed_database": "/admin/seed-db",
             "clips": "/clips",
@@ -145,9 +163,10 @@ async def root():
             "database_stats": "/stats"
         },
         "setup_instructions": [
-            "1. First run: POST /admin/setup-db",
-            "2. Then run: POST /admin/seed-db", 
-            "3. Test with: GET /clips"
+            "1. Check: GET /debug/database",
+            "2. Setup: POST /admin/setup-db",
+            "3. Seed: POST /admin/seed-db", 
+            "4. Test: GET /clips"
         ]
     }
 
@@ -160,16 +179,157 @@ def health_check():
         "timestamp": time.time(),
         "platform": "Vercel Serverless",
         "region": os.getenv("VERCEL_REGION", "unknown"),
-        "environment": settings.environment
+        "environment": settings.environment,
+        "message": "API is running. Use /debug/database to test database connection."
+    }
+
+# Debug environment variables
+@app.get("/debug/env")
+def debug_environment():
+    """Debug environment variables (safe version)"""
+    return {
+        "database_url_set": bool(settings.database_url and "supabase" in settings.database_url),
+        "database_host": settings.database_url.split('@')[1].split(':')[0] if '@' in settings.database_url else "Not found",
+        "secret_key_set": bool(settings.secret_key and len(settings.secret_key) > 20),
+        "environment": settings.environment,
+        "vercel_region": os.getenv("VERCEL_REGION", "not-set"),
+        "vercel_env": os.getenv("VERCEL_ENV", "not-set"),
+        "vercel_url": os.getenv("VERCEL_URL", "not-set")
+    }
+
+# Enhanced debug database connection
+@app.get("/debug/database") 
+def debug_database_connection():
+    """Test database connection directly without dependencies"""
+    try:
+        # Show what URL we're trying to use (hide password)
+        db_url_parts = settings.database_url.split(':')
+        if len(db_url_parts) >= 3 and '@' in settings.database_url:
+            password_part = settings.database_url.split(':')[2].split('@')[0]
+            safe_url = settings.database_url.replace(password_part, "****")
+        else:
+            safe_url = "Invalid URL format"
+        
+        logger.info(f"Testing database connection to: {safe_url}")
+        
+        # Create a fresh engine for testing with optimized settings
+        test_engine = create_engine(
+            settings.database_url,
+            pool_size=1,
+            max_overflow=0,
+            pool_pre_ping=True,
+            connect_args={
+                "connect_timeout": 30,
+                "application_name": "clips-api-debug",
+                "sslmode": "require"
+            }
+        )
+        
+        # Try to connect and run queries
+        with test_engine.connect() as connection:
+            # Test basic connection
+            result = connection.execute(text("SELECT version()"))
+            version = result.fetchone()
+            
+            # Test if clips table exists
+            try:
+                table_check = connection.execute(text("""
+                    SELECT COUNT(*) 
+                    FROM information_schema.tables 
+                    WHERE table_name = 'clips' AND table_schema = 'public'
+                """))
+                table_exists = table_check.fetchone()[0] > 0
+                
+                if table_exists:
+                    clip_count = connection.execute(text("SELECT COUNT(*) FROM clips")).fetchone()[0]
+                else:
+                    clip_count = 0
+                    
+            except Exception as table_error:
+                table_exists = False
+                clip_count = 0
+                logger.warning(f"Could not check clips table: {table_error}")
+            
+            return {
+                "status": "✅ CONNECTION SUCCESS",
+                "database_url": safe_url,
+                "postgresql_version": version[0][:100] if version else "Unknown",
+                "clips_table_exists": table_exists,
+                "clips_count": clip_count,
+                "environment": settings.environment,
+                "timestamp": time.time(),
+                "next_steps": [
+                    "Database connection is working!",
+                    "Run POST /admin/setup-db to create tables" if not table_exists else "Tables exist",
+                    "Run POST /admin/seed-db to add sample data" if clip_count == 0 else f"Database has {clip_count} clips"
+                ]
+            }
+            
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Database connection test failed: {error_msg}")
+        
+        # Provide specific error guidance
+        if "timeout" in error_msg.lower():
+            suggestion = "Connection timeout - check if Supabase project is active and not paused"
+        elif "authentication" in error_msg.lower() or "password" in error_msg.lower():
+            suggestion = "Authentication failed - check username/password in DATABASE_URL"
+        elif "does not exist" in error_msg.lower():
+            suggestion = "Database does not exist - check database name in connection string"
+        elif "connection refused" in error_msg.lower():
+            suggestion = "Connection refused - check host and port in connection string"
+        elif "ssl" in error_msg.lower():
+            suggestion = "SSL connection issue - Supabase requires SSL connections"
+        else:
+            suggestion = "Unknown connection error - check Supabase project status"
+            
+        return {
+            "status": "❌ CONNECTION FAILED",
+            "error": error_msg,
+            "database_url": safe_url if 'safe_url' in locals() else "Could not parse URL",
+            "suggestion": suggestion,
+            "troubleshooting_steps": [
+                "1. Check if Supabase project is active (not paused)",
+                "2. Verify DATABASE_URL format: postgresql://postgres:password@db.project.supabase.co:5432/postgres",
+                "3. Check if password contains special characters that need URL encoding",
+                "4. Ensure project allows connections (no IP restrictions)",
+                "5. Verify project ID and region are correct"
+            ],
+            "common_solutions": {
+                "paused_project": "Go to supabase.com dashboard and resume project",
+                "wrong_password": "Reset database password in Supabase settings",
+                "special_chars": "URL encode special characters in password",
+                "ip_restrictions": "Disable IP restrictions in Supabase network settings"
+            },
+            "timestamp": time.time()
+        }
+
+# Vercel-specific debug endpoint
+@app.get("/debug/vercel")
+def vercel_debug():
+    """Debug endpoint for Vercel deployment information"""
+    return {
+        "vercel_env": {
+            "region": os.getenv("VERCEL_REGION", "not-set"),
+            "url": os.getenv("VERCEL_URL", "not-set"),
+            "env": os.getenv("VERCEL_ENV", "not-set"),
+            "git_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "not-set")[:8] if os.getenv("VERCEL_GIT_COMMIT_SHA") else "not-set"
+        },
+        "app_config": {
+            "environment": settings.environment,
+            "database_host": settings.database_url.split('@')[1].split('/')[0] if '@' in settings.database_url else "localhost"
+        },
+        "platform": "Vercel Serverless",
+        "timestamp": time.time()
     }
 
 # Database health check (separate endpoint)
 @app.get("/health/database")
 def database_health_check(db: Session = Depends(get_db)):
-    """Database connectivity health check"""
+    """Database connectivity health check using dependency"""
     try:
         # Test Supabase connection
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         
         # Get basic stats from Supabase
         clip_count = db.query(models.Clip).count()
@@ -208,21 +368,41 @@ def database_health_check(db: Session = Depends(get_db)):
 def setup_database():
     """Setup database tables in Supabase (run this first after deployment)"""
     try:
+        # Test connection first
+        test_engine = create_engine(
+            settings.database_url,
+            connect_args={
+                "connect_timeout": 30,
+                "sslmode": "require"
+            }
+        )
+        
+        with test_engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        
         # Create tables
-        models.Base.metadata.create_all(bind=engine)
+        models.Base.metadata.create_all(bind=test_engine)
         
-        # Test connection
-        db = SessionLocal()
-        db.execute("SELECT 1")
-        
-        # Check if clips table exists and has data
-        existing_clips = db.query(models.Clip).count()
-        db.close()
+        # Verify table creation
+        with test_engine.connect() as connection:
+            result = connection.execute(text("""
+                SELECT COUNT(*) 
+                FROM information_schema.tables 
+                WHERE table_name = 'clips' AND table_schema = 'public'
+            """))
+            table_exists = result.fetchone()[0] > 0
+            
+            if not table_exists:
+                raise Exception("Table creation failed - clips table not found")
+            
+            # Check existing data
+            existing_clips = connection.execute(text("SELECT COUNT(*) FROM clips")).fetchone()[0]
         
         return {
             "message": "✅ Database tables created successfully!",
+            "clips_table_created": True,
             "existing_clips": existing_clips,
-            "next_step": "Run POST /admin/seed-db to add sample data",
+            "next_step": "Run POST /admin/seed-db to add sample data" if existing_clips == 0 else f"Database already has {existing_clips} clips",
             "platform": "Vercel",
             "database": "Supabase"
         }
@@ -231,7 +411,11 @@ def setup_database():
         logger.error(f"Database setup failed: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Database setup failed: {str(e)}"
+            detail={
+                "error": "Database setup failed",
+                "message": str(e),
+                "suggestion": "Check /debug/database first to ensure connection works"
+            }
         )
 
 # Seed database with sample data (run after setup)
@@ -554,53 +738,3 @@ def get_database_stats(
             status_code=500, 
             detail="Failed to retrieve database statistics"
         )
-
-# Vercel-specific debug endpoint
-@app.get("/debug/vercel")
-def vercel_debug():
-    """Debug endpoint for Vercel deployment information"""
-    return {
-        "vercel_env": {
-            "region": os.getenv("VERCEL_REGION", "not-set"),
-            "url": os.getenv("VERCEL_URL", "not-set"),
-            "env": os.getenv("VERCEL_ENV", "not-set"),
-            "git_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "not-set")[:8] if os.getenv("VERCEL_GIT_COMMIT_SHA") else "not-set"
-        },
-        "app_config": {
-            "environment": settings.environment,
-            "database_host": settings.database_url.split('@')[1].split('/')[0] if '@' in settings.database_url else "localhost"
-        },
-        "platform": "Vercel Serverless",
-        "timestamp": time.time()
-    }
-    
-@app.get("/debug/env")
-def debug_environment():
-    """Debug environment variables"""
-    return {
-        "database_url_set": bool(settings.database_url and "supabase" in settings.database_url),
-        "database_host": settings.database_url.split('@')[1].split(':')[0] if '@' in settings.database_url else "Not found",
-        "environment": settings.environment,
-        "vercel_region": os.getenv("VERCEL_REGION", "not-set")
-    }
-
-@app.get("/debug/database") 
-def debug_database_connection():
-    """Test database connection directly"""
-    try:
-        from sqlalchemy import create_engine, text
-        test_engine = create_engine(settings.database_url)
-        
-        with test_engine.connect() as connection:
-            result = connection.execute(text("SELECT version()"))
-            version = result.fetchone()
-            
-            return {
-                "status": "✅ SUCCESS",
-                "postgresql_version": version[0][:100] if version else "Unknown"
-            }
-    except Exception as e:
-        return {
-            "status": "❌ FAILED", 
-            "error": str(e)
-        }
