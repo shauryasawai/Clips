@@ -4,8 +4,6 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-# Remove Prometheus for Vercel serverless
-# from prometheus_fastapi_instrumentator import Instrumentator
 import time
 import logging
 from typing import List
@@ -15,42 +13,40 @@ from . import crud, models, schemas
 from .database import SessionLocal, engine
 from .config import settings
 
-# Create database tables (important for serverless)
-models.Base.metadata.create_all(bind=engine)
+# ❌ REMOVE THIS LINE FOR VERCEL - Don't create tables on import
+# models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Clips API",
     description="Backend service for streaming audio clips with Supabase database - Deployed on Vercel",
     version="1.0.0",
-    # Conditional docs for production
-    docs_url="/docs" if settings.environment != "production" else None,
-    redoc_url="/redoc" if settings.environment != "production" else None
+    # Always show docs for demo purposes
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
+# Enhanced CORS for Vercel
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://your-frontend-domain.com",
-        "https://*.vercel.app",  # Your Vercel deployments
-        "http://localhost:3000"  # Local development only
-    ] if settings.environment == "production" else ["*"],
-    allow_credentials=False,  
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Content-Type", "Authorization"],
-    max_age=600  
+    allow_origins=["*"],  # Open for demo, restrict in production
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    max_age=600
 )
 
-# Remove Prometheus for serverless - Vercel has built-in analytics
-# instrumentator = Instrumentator()
-# instrumentator.instrument(app).expose(app)
-
-# Database dependency
+# Database dependency with error handling
 def get_db():
-    db = SessionLocal()
+    db = None
     try:
+        db = SessionLocal()
         yield db
+    except Exception as e:
+        logging.error(f"Database connection failed: {e}")
+        raise HTTPException(status_code=503, detail="Database connection failed")
     finally:
-        db.close()
+        if db:
+            db.close()
 
 # Simplified logging for serverless
 logging.basicConfig(
@@ -59,27 +55,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Vercel serverless startup - no persistent state
-@app.on_event("startup")
-async def startup_event():
-    """Validate database connection on serverless startup"""
-    try:
-        db = SessionLocal()
-        # Quick connection test to Supabase
-        result = db.execute("SELECT 1")
-        result.fetchone()
-        db.close()
-        
-        logger.info("🚀 Clips API starting on Vercel...")
-        logger.info(f"🔧 Environment: {settings.environment}")
-        logger.info(f"🗄️ Database: Supabase PostgreSQL")
-        logger.info("✅ Serverless startup completed!")
-        
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-        # Don't raise exception - let it continue for better UX
-        logger.error("⚠️ Continuing without database validation...")
+# Remove startup event that tries to connect to database
+# @app.on_event("startup") - NOT NEEDED FOR VERCEL
 
+# In-memory rate limiting for serverless
 request_counts = defaultdict(list)
 
 def rate_limit(max_requests: int = 100, window: int = 300):
@@ -108,6 +87,7 @@ def rate_limit(max_requests: int = 100, window: int = 300):
             return func(request, *args, **kwargs)
         return wrapper
     return decorator
+
 # Simplified request logging for serverless
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -152,20 +132,41 @@ async def root():
         "platform": "Vercel Serverless",
         "database": "Supabase PostgreSQL",
         "environment": settings.environment,
+        "status": "online",
         "endpoints": {
-            "documentation": "/docs" if settings.environment != "production" else "Not available in production",
+            "documentation": "/docs",
             "health": "/health",
+            "setup_database": "/admin/setup-db",
+            "seed_database": "/admin/seed-db",
             "clips": "/clips",
             "stream": "/clips/{id}/stream",
             "stats": "/clips/{id}/stats",
-            "init": "/admin/init-db"
-        }
+            "popular": "/clips/popular",
+            "database_stats": "/stats"
+        },
+        "setup_instructions": [
+            "1. First run: POST /admin/setup-db",
+            "2. Then run: POST /admin/seed-db", 
+            "3. Test with: GET /clips"
+        ]
     }
 
-# Enhanced health check with Vercel info
+# Basic health check without database dependency
 @app.get("/health")
-def health_check(db: Session = Depends(get_db)):
-    """Comprehensive health check including Supabase connectivity"""
+def health_check():
+    """Basic health check for Vercel"""
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "platform": "Vercel Serverless",
+        "region": os.getenv("VERCEL_REGION", "unknown"),
+        "environment": settings.environment
+    }
+
+# Database health check (separate endpoint)
+@app.get("/health/database")
+def database_health_check(db: Session = Depends(get_db)):
+    """Database connectivity health check"""
     try:
         # Test Supabase connection
         db.execute("SELECT 1")
@@ -179,7 +180,6 @@ def health_check(db: Session = Depends(get_db)):
             "status": "healthy",
             "timestamp": time.time(),
             "platform": "Vercel Serverless",
-            "region": os.getenv("VERCEL_REGION", "unknown"),
             "database": {
                 "provider": "Supabase",
                 "status": "connected",
@@ -188,11 +188,10 @@ def health_check(db: Session = Depends(get_db)):
             "stats": {
                 "total_clips": clip_count,
                 "total_plays": total_play_count
-            },
-            "environment": settings.environment
+            }
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"Database health check failed: {e}")
         raise HTTPException(
             status_code=503, 
             detail={
@@ -204,17 +203,48 @@ def health_check(db: Session = Depends(get_db)):
             }
         )
 
-# Vercel database initialization endpoint
-@app.post("/admin/init-db")
-def init_database(db: Session = Depends(get_db)):
-    """Initialize Supabase database with sample data (run once after deployment)"""
+# Setup database tables (run this first)
+@app.post("/admin/setup-db")
+def setup_database():
+    """Setup database tables in Supabase (run this first after deployment)"""
+    try:
+        # Create tables
+        models.Base.metadata.create_all(bind=engine)
+        
+        # Test connection
+        db = SessionLocal()
+        db.execute("SELECT 1")
+        
+        # Check if clips table exists and has data
+        existing_clips = db.query(models.Clip).count()
+        db.close()
+        
+        return {
+            "message": "✅ Database tables created successfully!",
+            "existing_clips": existing_clips,
+            "next_step": "Run POST /admin/seed-db to add sample data",
+            "platform": "Vercel",
+            "database": "Supabase"
+        }
+        
+    except Exception as e:
+        logger.error(f"Database setup failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database setup failed: {str(e)}"
+        )
+
+# Seed database with sample data (run after setup)
+@app.post("/admin/seed-db")
+def seed_database(db: Session = Depends(get_db)):
+    """Seed Supabase database with sample clips data"""
     try:
         # Check if data already exists
-        existing_clips = crud.get_clips(db, limit=1)
-        if existing_clips:
+        existing_clips = db.query(models.Clip).count()
+        if existing_clips > 0:
             return {
-                "message": "Database already initialized",
-                "existing_clips": len(crud.get_clips(db)),
+                "message": "Database already has data",
+                "existing_clips": existing_clips,
                 "platform": "Vercel"
             }
         
@@ -271,26 +301,28 @@ def init_database(db: Session = Depends(get_db)):
             new_clip = crud.create_clip(db=db, clip=clip_schema)
             created_clips.append(new_clip.id)
         
-        logger.info(f"✨ Initialized Supabase database with {len(created_clips)} clips on Vercel")
+        logger.info(f"✨ Seeded Supabase database with {len(created_clips)} clips on Vercel")
         
         return {
-            "message": f"Database initialized successfully with {len(created_clips)} clips!",
+            "message": f"✅ Database seeded successfully with {len(created_clips)} clips!",
             "created_clip_ids": created_clips,
             "platform": "Vercel",
-            "database": "Supabase"
+            "database": "Supabase",
+            "next_step": "Test with GET /clips"
         }
         
     except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
+        logger.error(f"Database seeding failed: {e}")
         raise HTTPException(
             status_code=500, 
-            detail=f"Database initialization failed: {str(e)}"
+            detail=f"Database seeding failed: {str(e)}"
         )
 
-# Get clips with enhanced error handling
+# Get clips with enhanced error handling and rate limiting
 @app.get("/clips", response_model=List[schemas.Clip])
 @rate_limit(max_requests=50, window=300)
 def get_clips(
+    request: Request,  # Add request parameter for rate limiting
     skip: int = 0,
     limit: int = 100,
     genre: str = None,
@@ -300,10 +332,13 @@ def get_clips(
     Get list of all available clips from Supabase
     
     - **skip**: Number of clips to skip (pagination)
-    - **limit**: Maximum number of clips to return
+    - **limit**: Maximum number of clips to return (max 100)
     - **genre**: Filter by genre (optional)
     """
     try:
+        # Validate limit
+        limit = min(limit, 100)
+        
         clips = crud.get_clips(db, skip=skip, limit=limit)
         
         # Filter by genre if specified
@@ -320,10 +355,14 @@ def get_clips(
             detail="Failed to retrieve clips from database"
         )
 
-# Stream clip with enhanced logging
+# Stream clip with enhanced logging and rate limiting
 @app.get("/clips/{clip_id}/stream")
 @rate_limit(max_requests=50, window=300)
-def stream_clip(clip_id: int, db: Session = Depends(get_db)):
+def stream_clip(
+    request: Request,  # Add request parameter for rate limiting
+    clip_id: int, 
+    db: Session = Depends(get_db)
+):
     """
     Stream a clip and increment play count in Supabase
     
@@ -355,10 +394,14 @@ def stream_clip(clip_id: int, db: Session = Depends(get_db)):
             detail="Failed to stream clip"
         )
 
-# Get clip stats with enhanced response
+# Get clip stats with enhanced response and rate limiting
 @app.get("/clips/{clip_id}/stats", response_model=schemas.ClipStats)
 @rate_limit(max_requests=50, window=300)
-def get_clip_stats(clip_id: int, db: Session = Depends(get_db)):
+def get_clip_stats(
+    request: Request,  # Add request parameter for rate limiting
+    clip_id: int, 
+    db: Session = Depends(get_db)
+):
     """
     Get clip statistics from Supabase including play count
     
@@ -394,10 +437,14 @@ def get_clip_stats(clip_id: int, db: Session = Depends(get_db)):
             detail="Failed to retrieve clip statistics"
         )
 
-# Create clip with validation
+# Create clip with validation and rate limiting
 @app.post("/clips", response_model=schemas.Clip)
-@rate_limit(max_requests=50, window=300)
-def create_clip(clip: schemas.ClipCreate, db: Session = Depends(get_db)):
+@rate_limit(max_requests=10, window=300)  # Lower limit for creation
+def create_clip(
+    request: Request,  # Add request parameter for rate limiting
+    clip: schemas.ClipCreate, 
+    db: Session = Depends(get_db)
+):
     """
     Create a new clip in Supabase (bonus feature)
     
@@ -409,6 +456,13 @@ def create_clip(clip: schemas.ClipCreate, db: Session = Depends(get_db)):
             raise HTTPException(
                 status_code=400,
                 detail="Audio URL must be a valid HTTP/HTTPS URL"
+            )
+        
+        # Validate duration format
+        if not clip.duration.endswith('s'):
+            raise HTTPException(
+                status_code=400,
+                detail="Duration must be in format like '30s', '45s', etc."
             )
         
         new_clip = crud.create_clip(db=db, clip=clip)
@@ -427,13 +481,20 @@ def create_clip(clip: schemas.ClipCreate, db: Session = Depends(get_db)):
 # Bonus: Get popular clips
 @app.get("/clips/popular", response_model=List[schemas.Clip])
 @rate_limit(max_requests=50, window=300)
-def get_popular_clips(limit: int = 5, db: Session = Depends(get_db)):
+def get_popular_clips(
+    request: Request,  # Add request parameter for rate limiting
+    limit: int = 5, 
+    db: Session = Depends(get_db)
+):
     """
     Get most popular clips by play count from Supabase
     
-    - **limit**: Number of popular clips to return (default: 5)
+    - **limit**: Number of popular clips to return (default: 5, max: 20)
     """
     try:
+        # Validate limit
+        limit = min(limit, 20)
+        
         clips = crud.get_clips(db)
         # Sort by play count in descending order
         popular_clips = sorted(clips, key=lambda x: x.play_count, reverse=True)[:limit]
@@ -451,7 +512,10 @@ def get_popular_clips(limit: int = 5, db: Session = Depends(get_db)):
 # Bonus: Database stats endpoint
 @app.get("/stats")
 @rate_limit(max_requests=50, window=300)
-def get_database_stats(db: Session = Depends(get_db)):
+def get_database_stats(
+    request: Request,  # Add request parameter for rate limiting
+    db: Session = Depends(get_db)
+):
     """Get overall database statistics from Supabase"""
     try:
         clips = crud.get_clips(db)
