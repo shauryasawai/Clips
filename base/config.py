@@ -3,7 +3,7 @@ from typing import Optional
 import os
 
 class Settings(BaseSettings):
-    # Database configuration
+    # Database configuration with fallback
     database_url: str = os.getenv(
         "DATABASE_URL", 
         "postgresql://user:password@localhost:5432/clips_db"
