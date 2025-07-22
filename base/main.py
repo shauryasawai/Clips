@@ -9,6 +9,8 @@ import time
 import logging
 from typing import List
 import os
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
 
 from . import crud, models, schemas
 from .database import SessionLocal, engine
@@ -169,6 +171,11 @@ async def root():
             "4. Test: GET /clips"
         ]
     }
+
+@app.get("/metrics")
+def get_metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type="text/plain")
 
 # Basic health check without database dependency
 @app.get("/health")
