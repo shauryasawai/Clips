@@ -573,3 +573,34 @@ def vercel_debug():
         "platform": "Vercel Serverless",
         "timestamp": time.time()
     }
+    
+@app.get("/debug/env")
+def debug_environment():
+    """Debug environment variables"""
+    return {
+        "database_url_set": bool(settings.database_url and "supabase" in settings.database_url),
+        "database_host": settings.database_url.split('@')[1].split(':')[0] if '@' in settings.database_url else "Not found",
+        "environment": settings.environment,
+        "vercel_region": os.getenv("VERCEL_REGION", "not-set")
+    }
+
+@app.get("/debug/database") 
+def debug_database_connection():
+    """Test database connection directly"""
+    try:
+        from sqlalchemy import create_engine, text
+        test_engine = create_engine(settings.database_url)
+        
+        with test_engine.connect() as connection:
+            result = connection.execute(text("SELECT version()"))
+            version = result.fetchone()
+            
+            return {
+                "status": "✅ SUCCESS",
+                "postgresql_version": version[0][:100] if version else "Unknown"
+            }
+    except Exception as e:
+        return {
+            "status": "❌ FAILED", 
+            "error": str(e)
+        }
