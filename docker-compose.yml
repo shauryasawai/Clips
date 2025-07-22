@@ -1,0 +1,44 @@
+# docker-compose.yml - SECURE VERSION
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env  # Load from .env file instead of hardcoding
+    volumes:
+      - .:/app
+    depends_on:
+      - prometheus
+    environment:
+      # Only non-sensitive environment variables here
+      - ENVIRONMENT=development  # Override for local development
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring:/etc/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env  # Load Grafana password from .env too
+    environment:
+      # Override default admin password with environment variable
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  grafana_data:
